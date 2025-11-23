@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+# /usr/bin/trafficmon-daemon-nft
+"""
+OpenWrt Traffic Monitor Daemon - nftables 版本
+適用於 OpenWrt 24.10+ (firewall4/nftables)
+"""
+
+import json
+import time
+import subprocess
+import re
+from collections import defaultdict
+from pathlib import Path
+
+class TrafficMonitorNFT:
+    def __init__(self):
+        self.stats_file = "/tmp/trafficmon/stats.json"
+        self.data_dir = Path("/tmp/trafficmon")
+        self.data_dir.mkdir(exist_ok=True)
+        
+        # 應用定義 - 域名匹配規則
+        self.app_domains = {
+            'YouTube': ['youtube.com', 'googlevideo.com', 'ytimg.com'],
+            'Netflix': ['netflix.com', 'nflxvideo.net', 'nflximg.net'],
+            'Facebook': ['facebook.com', 'fbcdn.net', 'fb.com'],
+            'Instagram': ['instagram.com', 'cdninstagram.com'],
+            'Twitter': ['twitter.com', 'twimg.com', 't.co'],
+            'TikTok': ['tiktok.com', 'musical.ly', 'tiktokcdn.com'],
+            'Twitch': ['twitch.tv', 'ttvnw.net'],
+            'Spotify': ['spotify.com', 'scdn.co'],
+            'Amazon': ['amazon.com', 'amazonvideo.com', 'primevideo.com'],
+            'Google': ['google.com', 'gstatic.com', 'googleapis.com'],
+        }
+        
+        self.stats = defaultdict(lambda: {
+            'bytes': 0, 
+            'download': 0, 
+            'upload': 0, 
+            'sessions': 0
+        })
+        
+        # IP to App 映射緩存
+        self.ip_to_app = {}
+        
+        # 檢查 nDPI 支持
+        self.use_ndpi = self.check_ndpi()
+    
+    def check_ndpi(self):
+        """檢查是否安裝 nDPI for nftables"""
+        try:
+            result = subprocess.run(
+                ['nft', 'list', 'ruleset'],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            return 'ndpi' in result.stdout.lower()
+        except:
+            return False
+    
+    def setup_nftables_counter(self):
+        """使用 nftables 設置流量計數器
+        創建自定義 table 和 counter map
+        """
+        commands = [
+            # 創建 trafficmon table
+            ['nft', 'add', 'table', 'inet', 'trafficmon'],
+            
+            # 創建 IP set 用於快速匹配
+            ['nft', 'add', 'set', 'inet', 'trafficmon', 'tracked_ips', 
+             '{ type ipv4_addr; flags interval; }'],
+            
+            # 創建 counter map - 以 IP 地址為 key
+            ['nft', 'add', 'map', 'inet', 'trafficmon', 'ip_counters',
+             '{ type ipv4_addr : counter; }'],
+            
+            # 創建 prerouting chain (用於統計)
+            ['nft', 'add', 'chain', 'inet', 'trafficmon', 'prerouting',
+             '{ type filter hook prerouting priority -150; policy accept; }'],
+            
+            # 統計所有轉發流量
+            ['nft', 'add', 'rule', 'inet', 'trafficmon', 'prerouting',
+             'ip daddr @tracked_ips counter'],
+        ]
+        
+        # 清除舊配置
+        subprocess.run(['nft', 'delete', 'table', 'inet', 'trafficmon'],
+                      stderr=subprocess.DEVNULL)
+        
+        # 執行命令
+        for cmd in commands:
+            result = subprocess.run(cmd, capture_output=True)
+            if result.returncode != 0:
+                print(f"Warning: {' '.join(cmd)} failed: {result.stderr.decode()}")
+    
+    def setup_nftables_with_ndpi(self):
+        """使用 nDPI 標記的 nftables 設置"""
+        commands = [
+            ['nft', 'add', 'table', 'inet', 'trafficmon'],
+            ['nft', 'add', 'chain', 'inet', 'trafficmon', 'forward',
+             '{ type filter hook forward priority 0; policy accept; }'],
+        ]
+        
+        # 為每個應用創建 counter
+        mark_id = 100
+        for app in self.app_domains.keys():
+            app_lower = app.lower().replace(' ', '_')
+            # 創建 named counter
+            commands.append([
+                'nft', 'add', 'counter', 'inet', 'trafficmon', f'{app_lower}_counter'
+            ])
+            
+            # 如果有 nDPI 支持，使用 meta l4proto 匹配
+            # 注意: nDPI 在 nftables 的支持可能需要特殊模組
+            mark_id += 1
+        
+        subprocess.run(['nft', 'delete', 'table', 'inet', 'trafficmon'],
+                      stderr=subprocess.DEVNULL)
+        
+        for cmd in commands:
+            subprocess.run(cmd, stderr=subprocess.DEVNULL)
+    
+    def parse_dns_log(self):
+        """解析 dnsmasq 日誌，建立域名到 IP 的映射"""
+        domain_to_app = {}
+        new_ips = set()
+        
+        try:
+            # 使用 logread 讀取系統日誌
+            result = subprocess.run(
+                ['logread', '-e', 'dnsmasq'],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            
+            for line in result.stdout.split('\n'):
+                # 匹配 DNS 查詢和回應
+                # 格式: dnsmasq[123]: query[A] example.com from 192.168.1.100
+                # 格式: dnsmasq[123]: reply example.com is 1.2.3.4
+                
+                query_match = re.search(
+                    r'query\[A+\]\s+([^\s]+)\s+from\s+([0-9.]+)', line
+                )
+                if query_match:
+                    domain, client_ip = query_match.groups()
+                    # 匹配應用
+                    for app, domains in self.app_domains.items():
+                        if any(d in domain for d in domains):
+                            domain_to_app[domain] = app
+                            break
+                
+                # 匹配 DNS 回應以獲取目標 IP
+                reply_match = re.search(
+                    r'reply\s+([^\s]+)\s+is\s+([0-9.]+)', line
+                )
+                if reply_match:
+                    domain, ip = reply_match.groups()
+                    if domain in domain_to_app:
+                        app = domain_to_app[domain]
+                        self.ip_to_app[ip] = app
+                        new_ips.add(ip)
+        
+        except Exception as e:
+            print(f"Error parsing DNS log: {e}")
+        
+        # 更新 nftables IP set
+        if new_ips:
+            self.update_nftables_ipset(new_ips)
+        
+        return self.ip_to_app
+    
+    def update_nftables_ipset(self, ips):
+        """更新 nftables IP set"""
+        if not ips:
+            return
+        
+        # 批量添加 IP 到 set
+        elements = ', '.join(ips)
+        cmd = ['nft', 'add', 'element', 'inet', 'trafficmon', 'tracked_ips',
+               f'{{ {elements} }}']
+        subprocess.run(cmd, stderr=subprocess.DEVNULL)
+    
+    def get_nftables_counters(self):
+        """從 nftables 獲取計數器統計"""
+        try:
+            # 獲取整個 trafficmon table 的 JSON 輸出
+            result = subprocess.run(
+                ['nft', '-j', 'list', 'table', 'inet', 'trafficmon'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if result.returncode != 0:
+                return
+            
+            data = json.loads(result.stdout)
+            
+            # 解析 nftables JSON 格式
+            for item in data.get('nftables', []):
+                if 'rule' in item:
+                    rule = item['rule']
+                    
+                    # 查找包含 counter 的規則
+                    for expr in rule.get('expr', []):
+                        if 'counter' in expr:
+                            counter = expr['counter']
+                            bytes_count = counter.get('bytes', 0)
+                            packets = counter.get('packets', 0)
+                            
+                            # 嘗試從規則中提取 IP 地址
+                            ip = self.extract_ip_from_rule(rule)
+                            if ip and ip in self.ip_to_app:
+                                app = self.ip_to_app[ip]
+                                self.stats[app]['bytes'] += bytes_count
+                                self.stats[app]['sessions'] += packets
+        
+        except Exception as e:
+            print(f"Error reading nftables counters: {e}")
+    
+    def extract_ip_from_rule(self, rule):
+        """從 nftables 規則中提取 IP 地址"""
+        for expr in rule.get('expr', []):
+            if 'match' in expr:
+                match = expr['match']
+                if 'right' in match and isinstance(match['right'], str):
+                    # 簡單的 IP 地址匹配
+                    if re.match(r'\d+\.\d+\.\d+\.\d+', match['right']):
+                        return match['right']
+        return None
+    
+    def get_conntrack_stats(self):
+        """從 conntrack 獲取連接統計（備用方案）"""
+        try:
+            result = subprocess.run(
+                ['conntrack', '-L', '-o', 'extended'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            for line in result.stdout.split('\n'):
+                if not line.strip():
+                    continue
+                
+                # 解析連接信息
+                # 格式: ipv4 tcp src=192.168.1.10 dst=1.2.3.4 bytes=12345
+                match = re.search(
+                    r'src=([0-9.]+).*dst=([0-9.]+).*bytes=(\d+)', line
+                )
+                if match:
+                    src_ip, dst_ip, bytes_count = match.groups()
+                    bytes_count = int(bytes_count)
+                    
+                    # 檢查目標 IP 是否匹配已知應用
+                    app = self.ip_to_app.get(dst_ip)
+                    
+                    if app:
+                        self.stats[app]['bytes'] += bytes_count
+                        self.stats[app]['sessions'] += 1
+                        
+                        # 判斷方向
+                        if src_ip.startswith(('192.168.', '10.', '172.')):
+                            self.stats[app]['upload'] += bytes_count
+                        else:
+                            self.stats[app]['download'] += bytes_count
+        
+        except Exception as e:
+            print(f"Error reading conntrack: {e}")
+    
+    def save_stats(self):
+        """保存統計到文件"""
+        data = {
+            'timestamp': int(time.time()),
+            'mode': 'nftables+ndpi' if self.use_ndpi else 'nftables+dns',
+            'apps': [
+                {'name': app, **stats}
+                for app, stats in self.stats.items()
+                if stats['bytes'] > 0
+            ]
+        }
+        
+        with open(self.stats_file, 'w') as f:
+            json.dump(data, f, indent=2)
+    
+    def cleanup(self):
+        """清理 nftables 配置"""
+        subprocess.run(
+            ['nft', 'delete', 'table', 'inet', 'trafficmon'],
+            stderr=subprocess.DEVNULL
+        )
+    
+    def run(self):
+        """主循環"""
+        print(f"Traffic Monitor Daemon starting (nftables mode)...")
+        print(f"nDPI support: {self.use_ndpi}")
+        
+        try:
+            if self.use_ndpi:
+                self.setup_nftables_with_ndpi()
+            else:
+                self.setup_nftables_counter()
+            
+            while True:
+                try:
+                    # 更新 DNS 映射
+                    self.parse_dns_log()
+                    
+                    # 獲取統計
+                    if self.use_ndpi:
+                        self.get_nftables_counters()
+                    else:
+                        self.get_conntrack_stats()
+                    
+                    # 保存結果
+                    self.save_stats()
+                    
+                    time.sleep(5)  # 每5秒更新一次
+                    
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    print(f"Error in main loop: {e}")
+                    time.sleep(5)
+        
+        finally:
+            print("\nCleaning up...")
+            self.cleanup()
+
+if __name__ == '__main__':
+    monitor = TrafficMonitorNFT()
+    try:
+        monitor.run()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
